@@ -10,6 +10,7 @@ import time
 import json
 from llamaapi import LlamaAPI
 import threading
+import concurrent.futures
 FILE = 'dataset/ogbn_products_orig/ogbn-products.csv'
 
 arxiv_natural_lang_mapping = {
@@ -233,7 +234,7 @@ def get_raw_text_arxiv_2023(use_text=False, seed=0):
     data.train_id = np.sort(node_id[:int(num_nodes * 0.6)])
     data.val_id = np.sort(
         node_id[int(num_nodes * 0.6):int(num_nodes * 0.8)])
-    data.test_id = np.sort(node_id[int(num_nodes * 0.8):int(num_nodes * 0.8)+100])
+    data.test_id = np.sort(node_id[int(num_nodes * 0.8):])
 
     data.train_mask = torch.tensor(
         [x in data.train_id for x in range(num_nodes)])
@@ -276,7 +277,6 @@ def get_llama_predictions(llama, text_data):
         {"role": "user", "content": f'"{text_data} Give the most likely (only one) arXiv CS sub-category of this paper directly. Response to me in the form "cs.XX"."'},
     ]
     llama_messages[1]["content"] += "Your answer should be chosen from {}.".format(', '.join(['"{}"'.format(arxiv_natural_lang_mapping[key]) for key in arxiv_natural_lang_mapping.keys()]))
-    # print(llama_messages[1]["content"])
     api_request_json = {"model": "llama-13b-chat", "messages": llama_messages}
     response = llama.run(api_request_json)
     response_data = response.json()
@@ -292,7 +292,6 @@ def extract_category_abbreviation(response_text):
     start_index = response_text.find(prefix)
 
     if start_index != -1 and len(response_text) > start_index + len(prefix) + 2:
-        # 提取 cs. 后面两个字符
         category_abbreviation = response_text[start_index + len(prefix):start_index + len(prefix) + 2]
         return prefix + category_abbreviation
 
@@ -319,10 +318,8 @@ def evaluate_llama_predictions(llama, data, text):
     return accuracy
 
 def evaluate_llama_predictions_multi_thread(llama, data, text):
-    # 存储结果的全局变量
     results = []
 
-    # 锁用于在多线程中同步对共享资源的访问
     results_lock = threading.Lock()
 
     def process_node(node_index, text_data):
@@ -347,26 +344,57 @@ def evaluate_llama_predictions_multi_thread(llama, data, text):
         threads.append(thread)
         thread.start()
 
-    # 等待所有线程完成
     for thread in threads:
         thread.join()
 
-    # 计算准确率
     accuracy = sum(results) / len(results)
     return accuracy
+
+def evaluate_llama_predictions_multi_thread_02(llama, data, text, batch_size=10):
+    results = []
+
+    results_lock = threading.Lock()
+
+    def process_node(node_index, text_data):
+        response = get_llama_predictions(llama, text_data)
+        ground_truth_label = data.y[node_index].item()
+        prediction = extract_category_abbreviation(response)
+
+        if prediction is not None:
+            y_pred = get_category_index(prediction, original_dict)
+            if y_pred is not None and y_pred == ground_truth_label:
+                with results_lock:
+                    results.append(True)
+            else:
+                with results_lock:
+                    results.append(False)
+
+    # 通过ThreadPoolExecutor并行处理
+    with concurrent.futures.ThreadPoolExecutor(max_workers=batch_size) as executor:
+        futures = []
+
+        for node_index in data.test_id:
+            text_data = text[node_index]
+            futures.append(executor.submit(process_node, node_index, text_data))
+
+        # 等待所有任务完成
+        concurrent.futures.wait(futures)
+
+    accuracy = sum(results) / len(results)
+    return accuracy
+
 
 if __name__ == '__main__':
     llama = LlamaAPI('LL-4AQUhX62d88zD7OrnrKactz1Q6HBnH3YQ6HiE3yeEAMidnntqGi8V62nnIli6nbF')
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(device)
     data, num_classes, text = load_data(dataset='arxiv_2023',use_text=True)
-    print(data)
-    # # response = get_llama_predictions(llama,text[2])
-    # # prediction = extract_category_abbreviation(response)
-    # # print(response)
-    # # print(prediction)
-    # print(get_category_index('cs.DC',original_dict))
-    accuracy = evaluate_llama_predictions_multi_thread(llama, data, text)
+    # print(data)
+    # response = get_llama_predictions(llama,text[2])
+    # prediction = extract_category_abbreviation(response)
+    # print(response)
+    # print(prediction)
+    # new_func(evaluate_llama_predictions_multi_thread, llama, data, text)
+    accuracy = evaluate_llama_predictions_multi_thread_02(llama, data, text,batch_size=50)
     print(accuracy)
  
